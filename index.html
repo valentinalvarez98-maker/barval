@@ -1,100 +1,138 @@
-/**
- * BARVAL — Respaldo de datos en Google Sheets (Google Apps Script)
- *
- * Qué hace:
- *  - doGet  : devuelve el estado guardado (la app lo pide al abrirse).
- *  - doPost : guarda el estado completo que envía la app.
- *  - Además arma pestañas legibles (Productos, Promociones, Ventas, Entradas) para que
- *    veas y filtres los datos en Google Sheets. Esas pestañas son solo de lectura:
- *    se regeneran en cada guardado; los datos se editan desde la app.
- *
- * Uso: Hoja de cálculo nueva > Extensiones > Apps Script > pegar este código >
- * cambiar CLAVE > Implementar > Nueva implementación > Aplicación web
- * (Ejecutar como: Yo / Quién tiene acceso: Cualquier persona) > copiar la URL.
- */
-
-const CLAVE = 'CAMBIAR-ESTA-CLAVE';   // <- poné una clave larga y propia. La app te la va a pedir.
-const TROZO = 40000;                  // una celda admite ~50.000 caracteres: se guarda en trozos
-
-function salida_(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
-
-function doGet(e) {
-  if (!e || !e.parameter || e.parameter.clave !== CLAVE) return salida_({ ok: false, error: 'Clave incorrecta' });
-  const hoja = SpreadsheetApp.getActive().getSheetByName('Datos');
-  if (!hoja || hoja.getLastRow() < 2) return salida_({ ok: true, estado: null, actualizado: null });
-  const trozos = hoja.getRange(2, 1, hoja.getLastRow() - 1, 1).getValues().map(r => r[0]).join('');
-  return salida_({ ok: true, estado: JSON.parse(trozos), actualizado: hoja.getRange('B1').getValue() });
-}
-
-function doPost(e) {
-  const lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(20000);
-    const cuerpo = JSON.parse(e.postData.contents);   // la app envía texto plano con un JSON adentro
-    if (cuerpo.clave !== CLAVE) return salida_({ ok: false, error: 'Clave incorrecta' });
-    const ss = SpreadsheetApp.getActive();
-    const ahora = new Date();
-    guardarEstado_(ss, cuerpo.estado, ahora);
-    espejo_(ss, cuerpo.estado);
-    return salida_({ ok: true, actualizado: ahora });
-  } catch (err) {
-    return salida_({ ok: false, error: String(err) });
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function guardarEstado_(ss, estado, ahora) {
-  const hoja = ss.getSheetByName('Datos') || ss.insertSheet('Datos');
-  const texto = JSON.stringify(estado);
-  const filas = [];
-  for (let i = 0; i < texto.length; i += TROZO) filas.push([texto.substring(i, i + TROZO)]);
-  hoja.clear();
-  hoja.getRange('A1').setValue('Estado de la app (JSON en partes) — NO editar a mano');
-  hoja.getRange('B1').setValue(ahora);
-  if (filas.length) hoja.getRange(2, 1, filas.length, 1).setValues(filas);
-  hoja.setColumnWidth(1, 400);
-}
-
-function tabla_(ss, nombre, encabezados, filas) {
-  const hoja = ss.getSheetByName(nombre) || ss.insertSheet(nombre);
-  hoja.clear();
-  hoja.getRange(1, 1, 1, encabezados.length).setValues([encabezados])
-    .setFontWeight('bold').setBackground('#161d33').setFontColor('#ffffff');
-  if (filas.length) hoja.getRange(2, 1, filas.length, encabezados.length).setValues(filas);
-  hoja.setFrozenRows(1);
-  hoja.autoResizeColumns(1, encabezados.length);
-}
-
-function espejo_(ss, s) {
-  const prod = {}; (s.P || []).forEach(p => prod[p.id] = p);
-  const prom = {}; (s.PR || []).forEach(m => prom[m.id] = m);
-  const v = x => (x === null || x === undefined ? '' : x);
-
-  tabla_(ss, 'Productos',
-    ['Producto', 'Categoría', 'Presentación', 'Precio +$300.000', 'Precio +$1.000.000', 'Precio +$2.000.000',
-     'Precio venta individual', 'Stock inicial', 'Stock mínimo'],
-    (s.P || []).map(p => [p.n, p.c, p.pr, v(p.a), v(p.b), v(p.d), v((s.ip || {})[p.id]), v((s.si || {})[p.id]), v((s.mn || {})[p.id])]));
-
-  tabla_(ss, 'Promociones', ['Promoción', 'Precio de venta', 'Receta'],
-    (s.PR || []).map(m => [m.n, v(m.price),
-      (m.rec || []).map(r => r[1] + 'x ' + (prod[r[0]] ? prod[r[0]].n : '?') + (r[2] ? ' (variante)' : '')).join(' + ')]));
-
-  tabla_(ss, 'Ventas', ['Fecha', 'Tipo', 'Ítem', 'Variante', 'Cantidad', 'Precio unitario', 'Total'],
-    (s.v || []).map(x => {
-      const esInd = x.t === 'i';
-      const item = esInd ? prod[x.k] : prom[x.k];
-      const precio = esInd ? Number((s.ip || {})[x.k]) || 0 : item ? Number(item.price) || 0 : 0;
-      return [x.d, esInd ? 'Individual' : 'Promoción', item ? item.n : '(eliminado)',
-              x.vp != null && prod[x.vp] ? prod[x.vp].n : '', x.q, precio, precio * x.q];
-    }));
-
-  tabla_(ss, 'Entradas', ['Fecha', 'Producto', 'Cantidad', 'Costo unitario pagado', 'Total pagado'],
-    (s.e || []).map(x => [x.d, prod[x.p] ? prod[x.p].n : '(eliminado)', x.q, v(x.c),
-                          x.c !== null && x.c !== undefined ? x.c * x.q : '']));
-
-  tabla_(ss, 'Observaciones', ['Fecha', 'Estado', 'Nota'],
-    (s.obs || []).map(o => [o.d, o.ok ? 'Resuelta' : 'Pendiente', o.t]));
-}
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Barval — Sistema de gestión</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>
+:root{--n:#161d33;--n2:#232c4a;--t:#14b8a6;--a:#f59e0b;--r:#ef4444;--g:#10b981;--bg:#f1f4f9;--b:#e2e8f0;--tx:#1e293b;--mu:#64748b}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--tx);display:flex;min-height:100vh}
+aside{width:215px;background:linear-gradient(180deg,var(--n),var(--n2));color:#cbd5e1;padding:18px 12px;position:sticky;top:0;height:100vh;flex-shrink:0}
+aside h1{color:#fff;font-size:20px;margin:0 8px 2px;letter-spacing:1px}aside small{display:block;margin:0 8px 18px;font-size:11px;opacity:.7}
+aside button.t{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;padding:10px 12px;border-radius:9px;font:inherit;cursor:pointer;margin-bottom:3px}
+aside button.t:hover{background:#ffffff14}aside button.t.on{background:var(--t);color:#04302b;font-weight:700}
+aside .bt{margin-top:14px;display:flex;flex-direction:column;gap:7px}
+main{flex:1;padding:22px 26px;min-width:0}h2{margin:0 0 4px;font-size:22px}h3{margin:20px 0 8px;font-size:15px;color:var(--n2)}.sub{color:var(--mu);margin:0 0 16px;font-size:13px}
+.k{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:12px;margin-bottom:18px}
+.c{background:#fff;border-radius:14px;padding:13px 15px;box-shadow:0 1px 3px #0f172a14;border-left:4px solid var(--t)}.c.a{border-color:var(--a)}.c.r{border-color:var(--r)}.c.n{border-color:var(--n2)}
+.c span{font-size:11px;color:var(--mu);font-weight:700;text-transform:uppercase;letter-spacing:.4px}.c b{display:block;font-size:20px;margin-top:3px;color:var(--n)}.c b.s{font-size:13px;line-height:1.3;min-height:26px}
+.card{background:#fff;border-radius:14px;padding:16px;box-shadow:0 1px 3px #0f172a14;margin-bottom:16px}.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:1000px){.g2{grid-template-columns:1fr}aside{width:70px}aside h1,aside small{display:none}}
+table{border-collapse:collapse;width:100%;font-size:13px}th{background:#f8fafc;color:var(--mu);font-size:11px;text-transform:uppercase;letter-spacing:.4px;padding:9px 8px;text-align:left;position:sticky;top:0;border-bottom:2px solid var(--b)}
+td{padding:7px 8px;border-bottom:1px solid #eef2f7;vertical-align:middle}tr:hover td{background:#f8fafc}.r,th.r{text-align:right}.w{overflow:auto;max-height:68vh}
+input,select,textarea{padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;background:#fff}input:focus,select:focus,textarea:focus{outline:2px solid var(--t);border-color:var(--t)}
+input.in{background:#fffbeb;border-color:#fcd34d;width:96px;text-align:right}input.sm{width:62px}
+button.p,button.s,button.d{border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;cursor:pointer}button.p{background:var(--t);color:#04302b}button.p:hover{filter:brightness(1.08)}
+button.s{background:#e2e8f0;color:var(--n2)}button.d{background:#fee2e2;color:#b91c1c;padding:4px 9px}aside button.p,aside button.s{width:100%;text-align:left}
+.f{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}.f label{display:block;font-size:11px;font-weight:700;color:var(--mu);margin-bottom:3px;text-transform:uppercase}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700}.ok{background:#d1fae5;color:#065f46}.warn{background:#fef3c7;color:#92400e}.bad{background:#fee2e2;color:#b91c1c}.gr{background:#e2e8f0;color:#475569}
+.row{display:flex;align-items:center;gap:8px;margin:6px 0}.row i{width:210px;font-style:normal;font-size:12px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar{height:14px;border-radius:5px;background:linear-gradient(90deg,var(--t),#5eead4);min-width:2px}.row span{font-size:12px;color:var(--mu)}
+.note{color:var(--mu);font-size:12px}.nodata{color:var(--a);font-weight:600}details{margin-top:10px}textarea{width:100%;height:110px;font-family:monospace;font-size:12px}
+.ob{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #eef2f7}.ob textarea{flex:1;height:62px;font:inherit}.ob.d textarea{opacity:.5;text-decoration:line-through}.ob input[type=checkbox]{margin-top:8px;width:18px;height:18px}
+</style></head><body><aside><h1>BARVAL</h1><small>Sistema de gestión · catálogo M.A Distribución</small><div id="nv"></div>
+<div class="bt"><button class="p" onclick="$('#fi').click()">⬆ Importar catálogo</button><button class="s" onclick="expCat()">⬇ Exportar catálogo</button></div><div id="sy" style="margin:14px 8px 0;font-size:11px;line-height:1.35;opacity:.85"></div>
+<input type="file" id="fi" accept=".csv,.txt,.tsv" hidden onchange="impFile(this.files[0]);this.value=''"></aside><main id="m"></main><script>
+const D={"P":[["Gaseosa Fever Tree Agua Tonica Importada Nuevo 200ml x 24u","Gaseosa","200 ml x 24 u",3186,3154,3123,""],["Gaseosa Paso De Los Toros Pomelo 1,5l x 6u","Gaseosa","1,5 L x 6 u",2310,null,null,""],["Gaseosa Paso De Los Toros Tonica 1,5l x 6u","Gaseosa","1,5 L x 6 u",2310,null,null,""],["Gaseosa Pepsi 1,5l x 6u","Gaseosa","1,5 L x 6 u",2310,null,null,"Vence 10/12/2026"],["Gaseosa Pepsi Black 1,5l x 6u","Gaseosa","1,5 L x 6 u",2310,null,null,"Vence 23/11/2026"],["Gaseosa Seven Up 1,5l x 6u","Gaseosa","1,5 L x 6 u",2310,null,null,"Vence 18/11/2026"],["Gaseosa Coca Cola 2,25l","Gaseosa","2,25 L (pack no especificado)",4000,null,null,"Precio informado por texto ('Coca 2,25 ml $4000'); sin escalas ni pack. Verificar."],["Gaseosa Pritty","Gaseosa","No especificada",1900,null,null,"Precio informado por texto; sin presentación ni escalas. Verificar."],["Chacabuco","A definir","No especificada",5159,null,null,"Precio informado por texto; no se sabe qué producto es ni su presentación. Verificar."],["Speed Xl 500ml x 12u","Bebida Energizante","500 ml x 12 u",2012,1912,1831,"Se usa como 'Speed XL' en promos."],["Speed Xl Zero 500ml x 12u","Bebida Energizante","500 ml x 12 u",1919,1827,1784,""],["Cerveza Antares XPA Lata 473ml x 6u","Cerveza","473 ml x 6 u",2793,null,null,""],["Cerveza Amstel 710ml x 24u","Cerveza","710 ml x 24 u",2023,1982,1922,""],["Cerveza Andes Roja Lata 473ml x 24u","Cerveza","473 ml x 24 u",1839,null,null,"Vence 23/12/2026"],["Cerveza Andes Rubia Lata 473ml x 24u","Cerveza","473 ml x 24 u",1839,null,null,""],["Cerveza Budweisser Lata 473ml x 24u","Cerveza","473 ml x 24 u",1650,null,null,""],["Cerveza Corona Botella 710ml x 12u","Cerveza","710 ml x 12 u",4237,null,null,""],["Fernet Branca 750ml x 12u","Fernet","750 ml x 12 u",15955,14838,14519,""],["Fernet Branca Ed Limitada 180 Aniversario 750ml x 6u","Fernet","750 ml x 6 u",17879,null,null,"Stock limitado"],["Vodka Absolut Raspberry 750ml x 1u","Vodka","750 ml x 1 u",19792,19000,17813,""],["Vodka Absolut Regular 750ml x 1u","Vodka","750 ml x 1 u",17780,17069,16002,""],["Vodka Absolut Vainilla 750ml x 1u","Vodka","750 ml x 1 u",19792,19000,17813,""],["Vodka Absolut Watermelon 700ml x 1u","Vodka","700 ml x 1 u",19792,19000,17813,""],["Vodka Absolut Wild Berries 700ml x 1u","Vodka","700 ml x 1 u",19792,19000,17813,""],["Vodka Botellon Belverde 1,75l x 1u","Vodka","1,75 L x 1 u",240000,237600,232800,"Últimas unidades"],["Vodka Skyy 750ml x 12u","Vodka","750 ml x 12 u",6848,6711,6711,"Catálogo: precio +1M igual al +2M."],["Vodka Skyy Apricot 700ml x 12u","Vodka","700 ml x 12 u",8580,8408,8408,"Catálogo: precio +1M igual al +2M."],["Vodka Skyy Blood Orange 700ml x 12u","Vodka","700 ml x 12 u",8580,8408,8408,"Catálogo: precio +1M igual al +2M."],["Vodka Skyy Pineapple 700ml x 12u","Vodka","700 ml x 12 u",8580,8408,8408,"Catálogo: precio +1M igual al +2M."],["Vodka Skyy Raspberry 700ml x 12u","Vodka","700 ml x 12 u",8580,8408,8408,"Catálogo: precio +1M igual al +2M."],["Vodka Smirnoff Green Apple 700ml x 6u","Vodka","700 ml x 6 u",7638,7409,7256,""],["Carpano Rosso 950ml x 6u","Licor / Aperitivo","950 ml x 6 u",5751,null,null,""],["Licor Jagermeister 700ml x 1u","Licor / Aperitivo","700 ml x 1 u",24380,23892,23649,""],["Vino Viñas de Balbo Botellon Tinto 1125ml x 6u","Vino","1125 ml x 6 u",2160,2095,1955,""],["Vino Cordero Con Piel De Lobo Malbec 750ml x 6u","Vino","750 ml x 6 u",3590,3374,3302,""]],"PR":[["Fernet 750 + 1 Coca 2,25 L",21000,[[17,1,0],[6,1,0]],[]],["Fernet 750 + 2 Coca 2,25 L",26000,[[17,1,0],[6,2,0]],[]],["Sky saborizado + 2 Speed XL",15000,[[26,1,1],[9,2,0]],[26,27,28,29]],["Absolut saborizado + 2 Speed XL",26000,[[19,1,1],[9,2,0]],[19,21,22,23]],["Jäger + 2 Speed XL",34000,[[32,1,0],[9,2,0]],[]],["Six Pack Andes",20000,[[14,6,1]],[13,14]],["Balbo + 1 Pritty",6500,[[33,1,0],[7,1,0]],[]]],"si":{"6":13,"7":6,"8":6,"9":84,"14":24,"17":24,"19":6,"28":12,"29":12,"30":1,"31":6,"32":1,"33":6,"34":6},"v":[{"d":"2026-10-03","t":"p","k":0,"vp":null,"q":1},{"d":"2026-10-06","t":"p","k":5,"vp":null,"q":2}]};
+const K='barval-sys2',$=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>'&#'+c.charCodeAt(0)+';'),fm=n=>'$'+Math.round(n||0).toLocaleString('es-AR'),num=v=>v===''||v==null?null:+v,today=()=>new Date().toISOString().slice(0,10);
+function init(){return{P:D.P.map((p,i)=>({id:i,n:p[0],c:p[1],pr:p[2],a:p[3],b:p[4],d:p[5],nt:p[6]})),PR:D.PR.map((p,i)=>({id:i,n:p[0],price:p[1],rec:p[2],vars:p[3]})),ip:{},v:D.v,e:[],si:D.si,mn:{},def:6,cob:2,nid:1000}}
+let S=JSON.parse(localStorage.getItem(K)||'null')||init(),T='res',Q='',OR=false;const SYNC_URL='https://script.google.com/macros/s/AKfycbzKXHI9oYQgwAi84Vaf_j3ktRVdpM8IJMZJDu-vCyWTiaxjT90E0OLKJx0_MVy_D2BE/exec';
+let ck=localStorage.getItem('barval-clave')||'',syT=null,syMsg='';
+const save=()=>{S.ts=Date.now();localStorage.setItem(K,JSON.stringify(S));clearTimeout(syT);syT=setTimeout(push,1500)};
+function syS(m){syMsg=m;const e=$('#sy');if(e)e.textContent=m}
+function rpc(get){return fetch(get?SYNC_URL+'?clave='+encodeURIComponent(ck):SYNC_URL,get?{}:{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({clave:ck,estado:S})}).then(r=>r.json())}
+function push(){if(!ck)return syS('☁ Falta la clave (Configuración)');syS('☁ Guardando en Google Sheets…');rpc(0).then(r=>syS(r.ok?'☁ Sincronizado '+new Date().toLocaleTimeString('es-AR'):'☁ Error: '+r.error)).catch(()=>syS('☁ Sin conexión: guardado solo en este equipo'))}
+function pull(){if(!ck)return syS('☁ Falta la clave (Configuración)');syS('☁ Conectando con Google Sheets…');rpc(1).then(r=>{if(!r.ok)return syS('☁ Error: '+r.error);if(!r.estado)return push();
+const rt=r.estado.ts||0,lt=S.ts||0;if(rt>lt){S=r.estado;localStorage.setItem(K,JSON.stringify(S));draw();syS('☁ Datos cargados desde Google Sheets')}else if(rt<lt)push();else syS('☁ Sincronizado')}).catch(()=>syS('☁ Sin conexión: trabajando solo en este equipo'))}
+function setK(v){ck=v.trim();localStorage.setItem('barval-clave',ck);pull()}
+const pp=id=>S.P.find(p=>p.id==id),cost=p=>p?(p.b??p.a??0):0;
+function calc(){let egr=0;const u={},rev={},iu={},ir={},con={},ent={},err={};
+S.v.forEach((x,n)=>{if(x.t=='i'){const pr=+S.ip[x.k]||0;iu[x.k]=(iu[x.k]||0)+x.q;ir[x.k]=(ir[x.k]||0)+x.q*pr;con[x.k]=(con[x.k]||0)+x.q;if(!pr)err[n]='Falta precio';return}
+const pm=S.PR.find(p=>p.id==x.k);if(!pm){err[n]='Promoción inexistente';return}const pr=+pm.price||0;u[x.k]=(u[x.k]||0)+x.q;rev[x.k]=(rev[x.k]||0)+x.q*pr;
+const hv=pm.rec.some(r=>r[2]),okv=pm.vars.includes(x.vp);if(hv&&!okv)err[n]=x.vp==null?'Falta variante':'Variante inválida';else if(!pr)err[n]='Falta precio';
+pm.rec.forEach(([i,q,v])=>{if(!v)con[i]=(con[i]||0)+q*x.q;else if(okv)con[x.vp]=(con[x.vp]||0)+q*x.q})});
+S.e.forEach(x=>{ent[x.p]=(ent[x.p]||0)+x.q;egr+=x.q*(x.c??cost(pp(x.p)))});
+const I=S.P.map(p=>{const st=(+S.si[p.id]||0)+(ent[p.id]||0)-(con[p.id]||0),mn=S.mn[p.id]==null||S.mn[p.id]===''?S.def:+S.mn[p.id],es=st<0?'Stock negativo':st==0?'Sin stock':st<=mn?'Stock bajo':'OK';
+return{p,si:+S.si[p.id]||0,en:ent[p.id]||0,co:con[p.id]||0,st,mn,es,c:cost(p),rp:st<=mn?Math.max(0,mn*S.cob-st):0}});
+return{u,rev,iu,ir,err,I,egr}}
+const pc=e=>e=='OK'?'ok':e=='Stock bajo'?'warn':'bad',pcost=pm=>pm.rec.reduce((s,[i,q])=>s+q*cost(pp(i)),0),sum=o=>Object.values(o).reduce((a,b)=>a+b,0);
+const best=(o,list,f)=>{let m=0,r='—';list.forEach(x=>{const v=o[x.id]||0;if(v>m){m=v;r=f(x)}});return r};
+const saldo=c=>(+S.caja0||0)+sum(c.rev)+sum(c.ir)-c.egr;
+function bars(t,arr,f){const mx=Math.max(1,...arr.map(a=>a[1]));return `<h3>${t}</h3>`+arr.map(a=>`<div class="row"><i title="${esc(a[0])}">${esc(a[0])}</i><div class="bar" style="width:${a[1]/mx*52+.4}%"></div><span>${f(a[1])}</span></div>`).join('')}
+function line(){const m={};S.v.forEach(x=>m[x.d]=(m[x.d]||0)+x.q);const ds=Object.keys(m).sort();if(!ds.length)return '<p class="note">Sin ventas registradas todavía.</p>';
+const end=new Date(ds[ds.length-1]),pts=[];for(let i=29;i>=0;i--){const d=new Date(end-i*864e5).toISOString().slice(0,10);pts.push([d,m[d]||0])}
+const mx=Math.max(1,...pts.map(p=>p[1])),X=i=>20+i*(560/29),Y=v=>110-v/mx*90;
+return `<svg viewBox="0 0 600 130" width="100%"><polyline fill="none" stroke="#14b8a6" stroke-width="2.5" points="${pts.map((p,i)=>X(i)+','+Y(p[1])).join(' ')}"/>${pts.map((p,i)=>p[1]?`<circle cx="${X(i)}" cy="${Y(p[1])}" r="3.5" fill="#0f766e"><title>${p[0]}: ${p[1]} u</title></circle>`:'').join('')}<text x="20" y="127" font-size="10" fill="#64748b">${pts[0][0]}</text><text x="580" y="127" font-size="10" fill="#64748b" text-anchor="end">${pts[29][0]}</text></svg>`}
+function res(){const c=calc(),tf=sum(c.rev)+sum(c.ir),I=c.I,rep=I.filter(x=>x.rp>0).sort((a,b)=>b.rp-a.rp),
+gan=S.PR.reduce((a,pm)=>a+(+pm.price?(pm.price-pcost(pm))*(c.u[pm.id]||0):0),0)+S.P.reduce((a,p)=>a+(+S.ip[p.id]?(S.ip[p.id]-cost(p))*(c.iu[p.id]||0):0),0),
+K=[['Facturación total',fm(tf),''],['Saldo de la cuenta',fm(saldo(c)),saldo(c)<0?'r':'n'],['Compras de stock pagadas',fm(c.egr),'a'],['Promociones vendidas (u)',sum(c.u),''],['Productos sueltos vendidos (u)',sum(c.iu),''],['Ganancia estimada',fm(gan),''],
+['Valor del inventario',fm(I.reduce((a,x)=>a+x.st*x.c,0)),'n'],['Stock total (u)',I.reduce((a,x)=>a+x.st,0),'n'],['Productos',S.P.length,'n'],
+['Promo más vendida',best(c.u,S.PR,x=>x.n),'s'],['Promo mayor facturación',best(c.rev,S.PR,x=>x.n),'s'],['Suelto más vendido',best(c.iu,S.P,x=>x.n),'s'],
+['Stock bajo',I.filter(x=>x.es=='Stock bajo').length,'a'],['Sin stock',I.filter(x=>x.es=='Sin stock'||x.es=='Stock negativo').length,'r'],['A reponer',rep.length,'a'],
+['Costo de reposición',fm(rep.reduce((a,x)=>a+x.rp*x.c,0)),'a'],['Ventas con alerta',Object.keys(c.err).length,'r']];
+return `<h2>Resumen</h2><p class="sub">Costos con precio +$1.000.000; si el producto no lo tiene, +$300.000. Saldo de la cuenta = saldo inicial (Configuración) + ventas − compras de stock.</p><div class="k">${K.map(k=>`<div class="c ${k[2]=='s'?'':k[2]}"><span>${k[0]}</span><b class="${k[2]=='s'?'s':''}">${k[1]}</b></div>`).join('')}</div>
+<div class="g2"><div class="card">${bars('Unidades vendidas por promoción',S.PR.map(p=>[p.n,c.u[p.id]||0]),x=>x)}${bars('Facturación por promoción',S.PR.map(p=>[p.n,c.rev[p.id]||0]),fm)}<h3>Evolución de ventas (unidades por día)</h3>${line()}</div>
+<div class="card"><h3 style="margin-top:0">Productos a reponer</h3><div class="w" style="max-height:340px"><table><tr><th>Producto</th><th class="r">Stock</th><th class="r">A reponer</th><th class="r">Costo</th></tr>${rep.slice(0,40).map(x=>`<tr><td>${esc(x.p.n)}</td><td class="r"><span class="pill ${pc(x.es)}">${x.st}</span></td><td class="r"><b>${x.rp}</b></td><td class="r">${fm(x.rp*x.c)}</td></tr>`).join('')||'<tr><td colspan=4>Nada para reponer 🎉</td></tr>'}</table></div>
+<p class="note">Cargá el stock inicial en Inventario: con stock 0 todo figura como a reponer.</p>${bars('Stock actual (los 12 más bajos)',I.slice().sort((a,b)=>a.st-b.st).slice(0,12).map(x=>[x.p.n,Math.max(0,x.st)]),x=>x)}</div></div>`}
+function pro(){const q=Q.toLowerCase(),L=S.P.filter(p=>(p.n+p.c).toLowerCase().includes(q));
+const ni=(id,k,v)=>`<input class="in" type="number" min="0" value="${v??''}" placeholder="sin dato" onchange="setP(${id},'${k}',this.value)">`;
+return `<h2>Productos y precios</h2><p class="sub">Base maestra de la distribuidora. Editá los precios directamente: todo el sistema se recalcula. Vacío = el catálogo no informa ese precio.</p>
+<div class="card"><div class="f"><div><label>Buscar</label><input value="${esc(Q)}" id="sq" oninput="sq(this.value)" placeholder="producto o categoría" style="width:240px"></div><button class="p" onclick="$('#fi').click()">⬆ Importar catálogo (CSV)</button><button class="s" onclick="expCat()">⬇ Exportar catálogo (CSV)</button></div>
+<details><summary class="note" style="cursor:pointer">Pegar catálogo desde Excel / texto (Producto, Lista, +1M, +2M)</summary><textarea id="pt" placeholder="Fernet Branca 750ml x 12u;15955;14838;14519"></textarea><br><button class="p" onclick="impTxt($('#pt').value)">Aplicar precios</button></details>
+<details><summary class="note" style="cursor:pointer">Agregar producto nuevo</summary><div class="f" style="margin-top:8px"><div><label>Nombre</label><input id="nn" style="width:260px"></div><div><label>Categoría</label><input id="nc" value="A definir" style="width:130px"></div><div><label>+$300.000</label><input id="na" type="number" class="in"></div><div><label>+$1.000.000</label><input id="nb" type="number" class="in"></div><div><label>+$2.000.000</label><input id="nd" type="number" class="in"></div><button class="p" onclick="addP()">Agregar</button></div></details></div>
+<div class="card"><div class="w"><table><tr><th>Producto</th><th>Categoría</th><th>Presentación / nota</th><th class="r">+$300.000 (lista)</th><th class="r">+$1.000.000</th><th class="r">+$2.000.000</th><th class="r">Costo usado</th><th></th></tr>
+${L.map(p=>`<tr><td><b>${esc(p.n)}</b></td><td>${esc(p.c)}</td><td class="note">${esc(p.pr)} ${esc(p.nt)}</td><td class="r">${ni(p.id,'a',p.a)}</td><td class="r">${ni(p.id,'b',p.b)}</td><td class="r">${ni(p.id,'d',p.d)}</td><td class="r"><b>${fm(cost(p))}</b><div class="note">${p.b!=null?'+1M':'+300k'}</div></td><td><button class="d" onclick="delP(${p.id})">✕</button></td></tr>`).join('')}</table></div></div>`}
+function sq(v){Q=v;draw();const e=$('#sq');if(e){e.focus();const n=e.value.length;e.setSelectionRange(n,n)}}
+function setP(id,k,v){pp(id)[k]=num(v);save();draw()}
+function addP(){const n=$('#nn').value.trim();if(!n||S.P.some(p=>norm(p.n)==norm(n)))return alert('Escribí un nombre nuevo (no repetido).');S.P.push({id:S.nid++,n,c:$('#nc').value,pr:'',a:num($('#na').value),b:num($('#nb').value),d:num($('#nd').value),nt:''});save();draw()}
+function delP(id){const p=pp(id),used=S.PR.some(m=>m.rec.some(r=>r[0]==id))||S.v.some(x=>x.t=='i'&&x.k==id)||S.e.some(x=>x.p==id);if(confirm('¿Eliminar "'+p.n+'"?'+(used?'\nATENCIÓN: se usa en recetas, ventas o entradas.':''))){S.P=S.P.filter(x=>x.id!=id);save();draw()}}
+function prm(){const c=calc(),sel=(id,v)=>`<select id="${id}"><option value="">—</option>${S.P.map(p=>`<option value="${p.id}" ${p.id==v?'selected':''}>${esc(p.n)}</option>`).join('')}</select>`;
+return `<h2>Promociones</h2><p class="sub">Precio de venta editable (amarillo). Unidades y facturación salen del registro de ventas; el costo, de la receta y los precios de PRODUCTOS.</p>
+<div class="card"><div class="w"><table><tr><th>Promoción</th><th>Receta (productos que consume)</th><th class="r">Precio de venta</th><th class="r">Unid.</th><th class="r">Facturación</th><th class="r">Costo</th><th class="r">Ganancia/promo</th><th class="r">Margen</th><th></th></tr>
+${S.PR.map(m=>{const co=pcost(m),pr=+m.price||0;return `<tr><td><b>${esc(m.n)}</b></td><td class="note">${m.rec.map(([i,q,v])=>q+'× '+esc(pp(i)?.n)+(v?' <i>(variante a elegir)</i>':'')).join('<br>')}</td><td class="r"><input class="in" type="number" min="0" value="${m.price??''}" placeholder="cargar" onchange="S.PR.find(x=>x.id==${m.id}).price=num(this.value);save();draw()"></td><td class="r">${c.u[m.id]||0}</td><td class="r">${fm(c.rev[m.id])}</td><td class="r">${fm(co)}</td><td class="r">${pr?'<b>'+fm(pr-co)+'</b>':'—'}</td><td class="r">${pr?((pr-co)/pr*100).toFixed(1)+'%':'—'}</td><td><button class="d" onclick="delM(${m.id})">✕</button></td></tr>`}).join('')}</table></div>
+<details><summary class="note" style="cursor:pointer">➕ Nueva promoción</summary><div class="f" style="margin-top:8px"><div><label>Nombre</label><input id="mn" style="width:230px"></div><div><label>Precio de venta</label><input id="mp" type="number" class="in"></div></div>
+${[1,2,3].map(i=>`<div class="f" style="margin-top:6px"><div><label>Producto ${i}</label>${sel('m'+i)}</div><div><label>Cant.</label><input id="q${i}" type="number" min="1" value="1" class="sm"></div><div><label>¿Variante?</label><input type="checkbox" id="v${i}"></div></div>`).join('')}
+<div style="margin-top:6px"><label class="note">Variantes permitidas (si marcaste alguna; Ctrl/Cmd para varias)</label><br><select id="mv" multiple size="6" style="min-width:380px">${S.P.map(p=>`<option value="${p.id}">${esc(p.n)}</option>`).join('')}</select></div><br><button class="p" onclick="addM()">Crear promoción</button></details></div>
+<h3>Venta individual de productos</h3><p class="sub">Cargá el precio de venta de los productos que vendés sueltos; se eligen en la misma lista del registro de ventas.</p>
+<div class="card"><div class="f"><input value="${esc(Q)}" id="sq" oninput="sq(this.value)" placeholder="buscar producto" style="width:240px"></div><div class="w"><table><tr><th>Producto</th><th class="r">Precio de venta</th><th class="r">Unid.</th><th class="r">Facturación</th><th class="r">Costo unit.</th><th class="r">Ganancia/u</th><th class="r">Margen</th></tr>
+${S.P.filter(p=>p.n.toLowerCase().includes(Q.toLowerCase())).map(p=>{const pr=+S.ip[p.id]||0,co=cost(p);return `<tr><td>${esc(p.n)}</td><td class="r"><input class="in" type="number" min="0" value="${S.ip[p.id]??''}" placeholder="no se vende suelto" onchange="S.ip[${p.id}]=num(this.value);save();draw()"></td><td class="r">${c.iu[p.id]||0}</td><td class="r">${fm(c.ir[p.id])}</td><td class="r">${fm(co)}</td><td class="r">${pr?'<b>'+fm(pr-co)+'</b>':'—'}</td><td class="r">${pr?((pr-co)/pr*100).toFixed(1)+'%':'—'}</td></tr>`}).join('')}</table></div></div>`}
+function addM(){const n=$('#mn').value.trim();if(!n)return alert('Poné un nombre.');const rec=[1,2,3].filter(i=>$('#m'+i).value).map(i=>[+$('#m'+i).value,Math.max(1,+$('#q'+i).value||1),$('#v'+i).checked?1:0]);if(!rec.length)return alert('Agregá al menos un producto.');
+const vars=[...$('#mv').selectedOptions].map(o=>+o.value);if(rec.some(r=>r[2])&&!vars.length)return alert('Elegí las variantes permitidas.');S.PR.push({id:S.nid++,n,price:num($('#mp').value),rec,vars});save();draw()}
+function delM(id){if(confirm('¿Eliminar la promoción? Las ventas ya registradas de ella quedarán con alerta.')){S.PR=S.PR.filter(m=>m.id!=id);save();draw()}}
+function opts(){return `<optgroup label="Promociones">${S.PR.map(m=>`<option value="p${m.id}">${esc(m.n)}</option>`).join('')}</optgroup><optgroup label="Productos individuales">${S.P.map(p=>`<option value="i${p.id}">${esc(p.n)}</option>`).join('')}</optgroup>`}
+function vsel(){const v=$('#fp').value,pm=v[0]=='p'?S.PR.find(m=>m.id==v.slice(1)):null,vs=pm&&pm.rec.some(r=>r[2])?pm.vars:[];$('#fv').innerHTML=vs.length?vs.map(i=>`<option value="${i}">${esc(pp(i)?.n)}</option>`).join(''):'<option value="">(no aplica)</option>';$('#fv').disabled=!vs.length;tot()}
+function tot(){const v=$('#fp').value,q=+$('#fq').value||0,pr=v[0]=='p'?+S.PR.find(m=>m.id==v.slice(1))?.price||0:+S.ip[v.slice(1)]||0;$('#ft').innerHTML=pr?`${fm(pr)} × ${q} = <b>${fm(pr*q)}</b>`:'<span class="nodata">⚠ sin precio cargado</span>'}
+function addV(){const v=$('#fp').value,q=Math.floor(+$('#fq').value);if(!(q>0))return alert('La cantidad debe ser un entero mayor a 0.');S.v.push({d:$('#fd').value||today(),t:v[0],k:+v.slice(1),vp:v[0]=='p'&&!$('#fv').disabled?+$('#fv').value:null,q});save();draw()}
+function ven(){const c=calc();return `<h2>Registro de ventas</h2><p class="sub">Elegí una promoción o un producto suelto, la cantidad (y la variante si la promo la pide). El precio y el total salen solos.</p>
+<div class="card"><div class="f"><div><label>Fecha</label><input id="fd" type="date" value="${today()}"></div><div><label>Promoción o producto</label><select id="fp" onchange="vsel()" style="min-width:300px">${opts()}</select></div><div><label>Variante</label><select id="fv" style="min-width:230px"></select></div><div><label>Cantidad</label><input id="fq" type="number" min="1" value="1" class="sm" oninput="tot()"></div><div><label>Total</label><div id="ft" style="padding:7px 0"></div></div><button class="p" onclick="addV()">＋ Registrar venta</button></div></div>
+<div class="card"><div class="w"><table><tr><th>Fecha</th><th>Tipo</th><th>Ítem</th><th>Variante</th><th class="r">Cant.</th><th class="r">Precio</th><th class="r">Total</th><th>Estado</th><th></th></tr>${S.v.map((x,n)=>{const it=x.t=='i'?pp(x.k):S.PR.find(m=>m.id==x.k),pr=x.t=='i'?+S.ip[x.k]||0:+it?.price||0,er=c.err[n];
+return `<tr><td>${x.d}</td><td><span class="pill gr">${x.t=='i'?'Individual':'Promoción'}</span></td><td>${esc(it?.n||'(eliminado)')}</td><td class="note">${x.vp!=null?esc(pp(x.vp)?.n):'—'}</td><td class="r">${x.q}</td><td class="r">${fm(pr)}</td><td class="r"><b>${fm(pr*x.q)}</b></td><td><span class="pill ${er?'bad':'ok'}">${er||'OK'}</span></td><td><button class="d" onclick="S.v.splice(${n},1);save();draw()">✕</button></td></tr>`}).reverse().join('')||'<tr><td colspan=9>Sin ventas registradas</td></tr>'}</table></div></div>`}
+function eprev(r){const p=pp(+$('#ep').value);if(!p)return;if(r)$('#ec').value=cost(p);const q=+$('#eq').value||0,cu=+$('#ec').value||0,s=saldo(calc())-q*cu;$('#et').innerHTML=`Compra: ${q} × ${fm(cu)} = <b>${fm(q*cu)}</b> → saldo de la cuenta después: <b style="color:${s<0?'#b91c1c':'#065f46'}">${fm(s)}</b>`}
+function addE(){const q=Math.floor(+$('#eq').value),cu=num($('#ec').value);if(!(q>0))return alert('Cantidad inválida.');const s=saldo(calc())-q*(cu||0);if(s<0&&!confirm('Con esta compra el saldo de la cuenta quedaría en '+fm(s)+'. ¿Registrar igual?'))return;S.e.push({d:$('#ed').value||today(),p:+$('#ep').value,q,c:cu});save();draw()}
+function inv(){const c=calc();let L=c.I.filter(x=>x.p.n.toLowerCase().includes(Q.toLowerCase())&&(!OR||x.rp>0));
+return `<h2>Inventario</h2><p class="sub">Stock actual = Stock inicial + Entradas − Ventas (promos según receta + ventas individuales).</p>
+<div class="card"><div class="f"><div><label>Registrar entrada (compra a la distribuidora)</label><select id="ep" onchange="eprev(1)" style="min-width:300px">${S.P.map(p=>`<option value="${p.id}">${esc(p.n)}</option>`).join('')}</select></div><div><label>Fecha</label><input id="ed" type="date" value="${today()}"></div><div><label>Cantidad</label><input id="eq" type="number" min="1" value="1" class="sm" oninput="eprev()"></div><div><label>Costo unitario ($)</label><input id="ec" type="number" min="0" class="in" oninput="eprev()"></div><button class="p" onclick="addE()">Sumar al stock y descontar de la cuenta</button>
+<span class="note">${S.e.length} entradas · <button class="s" onclick="if(S.e.length&&confirm('¿Borrar la última entrada?')){S.e.pop();save();draw()}">deshacer última</button></span></div><p id="et" style="margin:10px 0 0"></p><p class="note" style="margin:4px 0 0">Saldo actual de la cuenta: <b>${fm(saldo(c))}</b> (saldo inicial + ventas − compras de stock). El costo sugerido sigue la regla +1M / +300k; cambialo si pagaste otro precio.</p></div>
+<div class="card"><h3 style="margin-top:0">Compras recientes</h3><table><tr><th>Fecha</th><th>Producto</th><th class="r">Cant.</th><th class="r">Costo unit.</th><th class="r">Total</th><th></th></tr>${S.e.map((x,n)=>{const cu=x.c??cost(pp(x.p));return `<tr><td>${x.d}</td><td>${esc(pp(x.p)?.n||'(eliminado)')}</td><td class="r">${x.q}</td><td class="r">${fm(cu)}</td><td class="r"><b>${fm(cu*x.q)}</b></td><td><button class="d" onclick="S.e.splice(${n},1);save();draw()">✕</button></td></tr>`}).reverse().slice(0,8).join('')||'<tr><td colspan=6>Sin compras registradas</td></tr>'}</table></div>
+<div class="card"><div class="f" style="margin-bottom:10px"><input value="${esc(Q)}" id="sq" oninput="sq(this.value)" placeholder="buscar producto" style="width:240px"><label style="margin:0"><input type="checkbox" ${OR?'checked':''} onchange="OR=this.checked;draw()"> solo a reponer</label><button class="s" onclick="expRep()">⬇ Exportar pedido de reposición</button></div>
+<div class="w"><table><tr><th>Producto</th><th class="r">Stock inicial</th><th class="r">Entradas</th><th class="r">Ventas</th><th class="r">Stock actual</th><th class="r">Mínimo</th><th class="r">Costo</th><th class="r">Valor</th><th>Estado</th><th class="r">A reponer</th></tr>
+${L.map(x=>`<tr><td>${esc(x.p.n)}</td><td class="r"><input class="in sm" type="number" value="${S.si[x.p.id]??''}" placeholder="0" onchange="S.si[${x.p.id}]=num(this.value);save();draw()"></td><td class="r">${x.en}</td><td class="r">${x.co}</td><td class="r"><b>${x.st}</b></td><td class="r"><input class="in sm" type="number" value="${S.mn[x.p.id]??''}" placeholder="${S.def}" onchange="S.mn[${x.p.id}]=num(this.value);save();draw()"></td><td class="r">${fm(x.c)}</td><td class="r">${fm(x.st*x.c)}</td><td><span class="pill ${pc(x.es)}">${x.es}</span></td><td class="r">${x.rp?'<b>'+x.rp+'</b> · '+fm(x.rp*x.c):''}</td></tr>`).join('')}</table></div></div>`}
+function cfg(){return `<h2>Configuración y respaldo</h2><p class="sub">Los datos se guardan en este navegador. Descargá una copia de seguridad seguido.</p><div class="card"><div class="f"><div><label>Stock mínimo por defecto</label><input class="in sm" type="number" value="${S.def}" onchange="S.def=+this.value;save();draw()"></div><div><label>Cobertura objetivo (× mínimo)</label><input class="in sm" type="number" value="${S.cob}" onchange="S.cob=+this.value;save();draw()"></div><div><label>Saldo inicial de la cuenta ($)</label><input class="in" style="width:140px" type="number" value="${S.caja0??''}" placeholder="0" onchange="S.caja0=num(this.value);save();draw()"></div></div>
+<p>Regla de costo: precio <b>+$1.000.000</b>; si el producto no lo tiene, <b>+$300.000</b>. A reponer = si stock ≤ mínimo: (mínimo × cobertura) − stock.</p></div>
+<div class="card"><div class="f"><button class="p" onclick="dl('barval-backup-'+today()+'.json',JSON.stringify(S),'application/json')">⬇ Copia de seguridad (.json)</button><div><label>Restaurar copia</label><input type="file" accept=".json" onchange="this.files[0].text().then(t=>{S=JSON.parse(t);save();draw()})"></div><button class="d" style="padding:8px 14px" onclick="if(confirm('¿Volver a los datos iniciales? Se borra todo lo cargado.')){S=init();save();draw()}">Restablecer todo</button></div></div>
+<div class="card"><h3 style="margin-top:0">☁ Google Sheets</h3><p class="note">Los datos se guardan solos en tu hoja de Google después de cada cambio y se cargan al abrir la página. La clave es la que pusiste en el Apps Script; se guarda solo en este navegador.</p><div class="f"><div><label>Clave</label><input type="password" id="ck" value="${esc(ck)}" style="width:260px" autocomplete="off"></div><button class="p" onclick="setK($('#ck').value)">Guardar clave y sincronizar</button><button class="s" onclick="pull()">Sincronizar ahora</button></div><p class="note">${esc(syMsg)||'Sin sincronizar todavía'}</p></div>`}
+function addO(){const x=$('#ot').value.trim();if(!x)return;(S.obs=S.obs||[]).push({id:S.nid++,d:today(),t:x,ok:0});save();draw()}
+function obs(){const L=(S.obs||[]).slice().reverse(),p=L.filter(o=>!o.ok).length;return `<h2>Observaciones</h2><p class="sub">Anotaciones libres: pendientes, pedidos, recordatorios. ${p} pendiente${p==1?'':'s'}.</p>
+<div class="card"><div class="f"><div style="flex:1;min-width:280px"><label>Nueva anotación</label><textarea id="ot" style="height:80px;font-family:inherit;font-size:14px" placeholder="Escribí tu nota…"></textarea></div><button class="p" onclick="addO()">＋ Agregar</button></div></div>
+<div class="card">${L.map(o=>`<div class="ob ${o.ok?'d':''}"><input type="checkbox" ${o.ok?'checked':''} title="Marcar como resuelta" onchange="S.obs.find(x=>x.id==${o.id}).ok=this.checked?1:0;save();draw()"><span class="note" style="width:78px">${o.d}</span><textarea onchange="S.obs.find(x=>x.id==${o.id}).t=this.value;save()">${esc(o.t)}</textarea><button class="d" onclick="if(confirm('¿Borrar esta nota?')){S.obs=S.obs.filter(x=>x.id!=${o.id});save();draw()}">✕</button></div>`).join('')||'<p class="note">Todavía no hay anotaciones.</p>'}</div>`}
+const norm=s=>String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
+function dl(n,t,m){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+t],{type:m||'text/csv'}));a.download=n;a.click()}
+const csv=r=>r.map(l=>l.map(c=>'"'+String(c??'').replace(/"/g,'""')+'"').join(';')).join('\r\n');
+function expCat(){dl('catalogo-barval-'+today()+'.csv',csv([['Producto','Categoría','Presentación','+$300.000 (lista)','+$1.000.000','+$2.000.000'],...S.P.map(p=>[p.n,p.c,p.pr,p.a??'',p.b??'',p.d??''])]))}
+function expRep(){dl('pedido-reposicion-'+today()+'.csv',csv([['Producto','Stock actual','A reponer (u)','Costo unitario','Costo total'],...calc().I.filter(x=>x.rp>0).map(x=>[x.p.n,x.st,x.rp,x.c,x.rp*x.c])]))}
+function pn(s){s=String(s??'').replace(/[^\d,.]/g,'');if(!s)return null;if(s.includes(',')&&s.includes('.'))s=s.replace(/\./g,'').replace(',','.');else if(s.includes(','))s=/,\d{1,2}$/.test(s)?s.replace(',','.'):s.replace(/,/g,'');else if(/^\d{1,3}(\.\d{3})+$/.test(s))s=s.replace(/\./g,'');const v=parseFloat(s);return isNaN(v)?null:v}
+function impFile(f){if(f)f.text().then(impTxt)}
+function impTxt(t){const rows=t.replace(/^\ufeff/,'').split(/\r?\n/).filter(l=>l.trim());if(!rows.length)return alert('El archivo está vacío.');const dl_=['\t',';',','].find(d=>rows[0].includes(d))||';';let R=rows.map(l=>l.split(dl_).map(c=>c.trim().replace(/^"|"$/g,'')));
+let off=1;if(/categor/i.test(R[0].join(';')))off=3;if(pn(R[0][off])==null&&!/\d/.test(R[0][off]||''))R.shift();
+const up=[],nw=[],seen=new Set();R.forEach(r=>{if(!r[0])return;const a=pn(r[off]),b=pn(r[off+1]),d=pn(r[off+2]),p=S.P.find(x=>norm(x.n)==norm(r[0]));if(a==null&&b==null&&d==null)return;seen.add(norm(r[0]));p?up.push([p,a,b,d]):nw.push([r[0],off==3?r[1]:'A definir',off==3?r[2]:'',a,b,d])});
+if(!up.length&&!nw.length)return alert('No se encontraron precios. Formato: Producto;Lista;+1M;+2M (o el CSV exportado).');
+const ch=up.filter(([p,a,b,d])=>p.a!=a||p.b!=b||p.d!=d).length,miss=S.P.filter(p=>!seen.has(norm(p.n))).length;
+if(!confirm(`Catálogo leído:\n• ${up.length} productos existentes (${ch} con precios distintos)\n• ${nw.length} productos nuevos que se agregarán\n• ${miss} productos del sistema no están en el archivo (se mantienen igual)\n\nLos precios vacíos del archivo se guardan como "sin dato". ¿Aplicar?`))return;
+up.forEach(([p,a,b,d])=>{p.a=a;p.b=b;p.d=d});nw.forEach(([n,c,pr,a,b,d])=>S.P.push({id:S.nid++,n,c,pr,a,b,d,nt:'Agregado por importación'}));save();T='pro';draw()}
+const tabs={res:'📊 Resumen',pro:'🏷 Productos',prm:'🎁 Promociones',ven:'🧾 Ventas',inv:'📦 Inventario',obs:'📝 Observaciones',cfg:'⚙ Configuración'};
+function draw(){$('#nv').innerHTML=Object.entries(tabs).map(([k,v])=>`<button class="t ${k==T?'on':''}" onclick="T='${k}';Q='';draw()">${v}</button>`).join('');$('#m').innerHTML={res,pro,prm,ven,inv,obs,cfg}[T]();if(T=='ven')vsel();if(T=='inv')eprev(1)}
+draw();pull();
+</script></body></html>
